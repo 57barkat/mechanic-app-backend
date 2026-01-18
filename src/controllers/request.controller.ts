@@ -11,17 +11,16 @@ interface AuthRequest extends ExRequest {
   user?: User; // extended req.user
 }
 
-/* ================= CREATE REQUEST ================= */
 export const createRequest = async (req: AuthRequest, res: Response) => {
   try {
     const { problemType, lat, lng, description } = req.body;
     const user = req.user as User;
 
-    if (!lat || !lng || !problemType) {
+    if (!lat || !lng || !problemType || !description) {
       return res.status(400).json({ message: "Missing fields" });
     }
 
-    const repo = AppDataSource.getRepository(JobRequest);
+    const requestRepo = AppDataSource.getRepository(JobRequest);
     const userRepo = AppDataSource.getRepository(User);
 
     // find online helpers
@@ -36,6 +35,7 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
 
     // calculate suggested price based on distance
     let suggestedPrice = 100;
+
     if (onlineHelpers.length > 0) {
       const distances = onlineHelpers.map((h) =>
         getDistance(
@@ -43,11 +43,13 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
           { latitude: h.lat!, longitude: h.lng! }
         )
       );
-      const nearestDistance = Math.min(...distances) / 1000; // km
-      suggestedPrice += nearestDistance * 50;
+
+      const nearestDistanceKm = Math.min(...distances) / 1000;
+      suggestedPrice += nearestDistanceKm * 50;
     }
 
-    const newRequest = repo.create({
+    // create request
+    const newRequest = requestRepo.create({
       user,
       problemType,
       description,
@@ -57,14 +59,16 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       suggestedPrice,
     });
 
-    await repo.save(newRequest);
-
+    await requestRepo.save(newRequest);
+    console.log(req.body);
+    console.log(newRequest);
     console.log(`✅ New request created by user ${user.id}`);
 
-    // emit request to all online helpers
+    // emit to helpers WITH user name & location
     io.emit("request:new", {
       requestId: newRequest.id,
       userId: user.id,
+      userName: user.name, // ✅ IMPORTANT
       problemType,
       description,
       lat,
@@ -72,16 +76,26 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       suggestedPrice,
     });
 
-    return res
-      .status(201)
-      .json({ message: "Request created", request: newRequest });
+    return res.status(201).json({
+      message: "Request created",
+      request: {
+        id: newRequest.id,
+        userId: user.id,
+        userName: user.name,
+        problemType,
+        description,
+        lat,
+        lng,
+        suggestedPrice,
+        status: newRequest.status,
+      },
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Server error" });
   }
 };
 
-/* ================= MAKE OFFER ================= */
 export const makeOffer = async (req: AuthRequest, res: Response) => {
   try {
     const { requestId, offeredPrice } = req.body;
@@ -99,24 +113,64 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
       relations: ["user"],
     });
 
-    if (!request) return res.status(404).json({ message: "Request not found" });
+    if (!request) {
+      return res.status(404).json({ message: "Request not found" });
+    }
 
-    const offer = offerRepo.create({ mechanic, request, offeredPrice });
-    await offerRepo.save(offer);
-
-    console.log(
-      `🟢 Mechanic ${mechanic.id} made offer for request ${request.id}: ${offeredPrice}`
-    );
-    io.to(`user_${request.user.id}`).emit("offer:new", {
-      id: offer.id,
-      offeredPrice,
-      mechanic: {
-        userId: mechanic.id,
-        name: mechanic.name,
+    // ❌ Prevent duplicate offers by same helper
+    const existingOffer = await offerRepo.findOne({
+      where: {
+        request: { id: requestId },
+        mechanic: { id: mechanic.id },
       },
     });
 
-    return res.json({ message: "Offer sent", offer });
+    if (existingOffer) {
+      return res.status(400).json({ message: "Offer already sent" });
+    }
+
+    // ✅ Calculate distance (helper → user)
+    const distanceKm =
+      mechanic.lat && mechanic.lng
+        ? getDistance(
+            { latitude: mechanic.lat, longitude: mechanic.lng },
+            { latitude: request.lat, longitude: request.lng }
+          ) / 1000
+        : null;
+
+    // ✅ Create offer
+    const offer = offerRepo.create({
+      mechanic,
+      request,
+      offeredPrice,
+    });
+
+    await offerRepo.save(offer);
+
+    console.log(
+      `🟢 Mechanic ${mechanic.id} offered $${offeredPrice} for request ${request.id}`
+    );
+
+    // ✅ Emit full offer data to USER
+    io.to(`user_${request.user.id}`).emit("offer:new", {
+      id: offer.id,
+      requestId: request.id,
+      offeredPrice,
+      distanceKm: distanceKm ? Number(distanceKm.toFixed(2)) : null,
+      helper: {
+        userId: mechanic.id,
+        name: mechanic.name,
+        lat: mechanic.lat,
+        lng: mechanic.lng,
+        rating: mechanic.rating || 0,
+        ratingCount: mechanic.ratingCount || 0,
+      },
+    });
+
+    return res.json({
+      message: "Offer sent",
+      offerId: offer.id,
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Server error" });
@@ -243,7 +297,6 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
     const requestRepo = AppDataSource.getRepository(JobRequest);
     const userRepo = AppDataSource.getRepository(User);
 
-    // 1. Find the request
     const request = await requestRepo.findOne({
       where: { id: requestId },
       relations: ["user", "helper"],
@@ -255,36 +308,34 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
         .json({ message: "Unauthorized or request not found" });
     }
 
-    if (request.status === "completed") {
-      return res
-        .status(400)
-        .json({ message: "Job already marked as completed" });
-    }
-
-    // 2. Update Request details
     request.status = "completed";
     request.finalPrice = finalPrice;
     await requestRepo.save(request);
 
-    // 3. Update Helper's Lifetime Earnings
-    // We fetch a fresh copy of the helper to ensure data integrity
+    // Update Helper Profile and get fresh data
     const helperProfile = await userRepo.findOne({
       where: { id: helperUser.id },
     });
     if (helperProfile) {
       helperProfile.totalEarnings =
-        (helperProfile.totalEarnings || 0) + finalPrice;
+        (Number(helperProfile.totalEarnings) || 0) + Number(finalPrice);
       await userRepo.save(helperProfile);
+
+      // Notify Helper of updated earnings immediately
+      io.to(`mechanic_${helperProfile.id}`).emit("stats:update", {
+        earnings: helperProfile.totalEarnings,
+        rating: helperProfile.rating,
+        count: helperProfile.ratingCount,
+      });
     }
 
-    // 4. Notify User
     io.to(`user_${request.user.id}`).emit("helper:completed", {
       requestId: request.id,
       finalPrice,
     });
 
     return res.json({
-      message: "Work completed and earnings updated",
+      message: "Work completed",
       totalEarnings: helperProfile?.totalEarnings,
     });
   } catch (err) {
@@ -293,59 +344,62 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
   }
 };
 
-/* ================= USER RATE HELPER ================= */
 export const userRateHelper = async (req: AuthRequest, res: Response) => {
   try {
     const { requestId, rating } = req.body;
+    console.log("Rating received:", req.body);
     const user = req.user as User;
-
-    if (!rating || rating < 1 || rating > 5) {
-      return res.status(400).json({ message: "Invalid rating value" });
-    }
 
     const requestRepo = AppDataSource.getRepository(JobRequest);
     const userRepo = AppDataSource.getRepository(User);
 
-    // 1. Find the request and the helper
+    // 1. Fetch request AND the helper object
     const request = await requestRepo.findOne({
       where: { id: requestId },
-      relations: ["user", "helper"],
+      relations: ["helper", "user"],
     });
 
     if (!request) return res.status(404).json({ message: "Request not found" });
-    if (request.user.id !== user.id)
-      return res.status(403).json({ message: "Forbidden" });
     if (request.rating)
       return res.status(400).json({ message: "Already rated" });
 
-    // 2. Save rating to the Request (Transaction History)
-    request.rating = rating;
+    // 2. Save rating to the request
+    request.rating = Number(rating);
     await requestRepo.save(request);
 
-    // 3. Update the Helper's Profile Rating
-    const helper = request.helper;
-    if (helper) {
-      const oldCount = helper.ratingCount || 0;
-      const oldRating = helper.rating || 0;
+    // 3. Update Helper Profile
+    if (request.helper) {
+      const helper = request.helper;
 
-      // Calculate new average
-      const newCount = oldCount + 1;
-      const newAverage = (oldRating * oldCount + rating) / newCount;
+      // Force conversion to numbers to be safe
+      const currentRating = Number(helper.rating) || 0;
+      const currentCount = Number(helper.ratingCount) || 0;
+      const newRatingInput = Number(rating);
 
+      const newCount = currentCount + 1;
+      const newAverage =
+        (currentRating * currentCount + newRatingInput) / newCount;
+
+      // Update helper fields
       helper.rating = parseFloat(newAverage.toFixed(2));
       helper.ratingCount = newCount;
 
+      // SAVE THE HELPER
       await userRepo.save(helper);
 
-      // 4. Notify helper about rating via Socket
-      io.to(`mechanic_${helper.id}`).emit("user:rating", {
-        requestId: request.id,
-        rating,
-        newAverage: helper.rating,
+      console.log(
+        `✅ DB UPDATED: Helper ${helper.id} now has rating ${helper.rating}`
+      );
+
+      // 4. Send updated stats to helper via Socket
+      io.to(`mechanic_${helper.id}`).emit("stats:update", {
+        rating: helper.rating,
+        earnings: helper.totalEarnings,
+        count: helper.ratingCount,
       });
     }
 
-    return res.json({ message: "Rating submitted and profile updated" });
+    return res.json({ message: "Rating saved" });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Server error" });

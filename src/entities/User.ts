@@ -73,11 +73,23 @@ export class User {
   @Column({ type: "text", nullable: true })
   cnicImage!: string | null;
 
-  @Column("double precision", { default: 0 })
+  @Column("double precision", {
+    default: 0,
+    transformer: {
+      to: (value: number) => value,
+      from: (value: string) => parseFloat(value) || 0,
+    },
+  })
   totalEarnings!: number;
 
-  @Column("double precision", { default: 0 })
-  rating!: number; // Average rating (e.g., 4.5)
+  @Column("double precision", {
+    default: 0,
+    transformer: {
+      to: (value: number) => value,
+      from: (value: string) => parseFloat(value) || 0,
+    },
+  })
+  rating!: number;
 
   @Column({ type: "int", default: 0 })
   ratingCount!: number; // Total number of people who rated them

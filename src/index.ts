@@ -81,10 +81,22 @@ io.on("connection", (socket: Socket) => {
       lat: null,
       lng: null,
     });
-    await AppDataSource.getRepository(User).update(
-      { id: userId },
-      { isOnline: true }
-    );
+
+    const userRepo = AppDataSource.getRepository(User);
+
+    // 1. Update online status
+    await userRepo.update({ id: userId }, { isOnline: true });
+
+    // 2. FETCH REAL STATS FROM DB TO SYNC FRONTEND
+    const helperProfile = await userRepo.findOne({ where: { id: userId } });
+    if (helperProfile) {
+      socket.emit("stats:update", {
+        rating: helperProfile.rating || 0,
+        earnings: helperProfile.totalEarnings || 0,
+        count: helperProfile.ratingCount || 0,
+      });
+    }
+
     emitMechanics();
   });
 
@@ -93,8 +105,8 @@ io.on("connection", (socket: Socket) => {
     if (mech) {
       mech.lat = lat;
       mech.lng = lng;
-      // Note: Updating DB every few seconds might be heavy.
-      // Consider only updating the Map (onlineMechanics) and saving to DB less frequently.
+      // Note: Updating DB every update is heavy.
+      // In production, consider saving location to Redis or only updating Map.
       await AppDataSource.getRepository(User).update(
         { id: userId },
         { lat, lng }
@@ -108,7 +120,6 @@ io.on("connection", (socket: Socket) => {
   // Helper reached user
   socket.on("ride:helper-arrived", ({ requestId }) => {
     console.log(`🟢 Helper ${userId} reached for request ${requestId}`);
-    // Notify user
     io.to(`user_${requestId}`).emit("ride:helper-arrived", { requestId });
   });
 
@@ -125,28 +136,19 @@ io.on("connection", (socket: Socket) => {
     );
     // Notify user to show rating screen
     io.to(`user_${requestId}`).emit("ride:work-done", { requestId });
-    // Notify helper to show payment confirmation screen
+    // This is handled by the Controller now, but kept for UI feedback
     io.to(`mechanic_${userId}`).emit("ride:show-payment", {
       requestId,
       finalPrice,
     });
   });
 
-  // User submits rating for helper
-  socket.on("user:rate-helper", ({ requestId, rating }) => {
-    console.log(
-      `⭐ User ${userId} rated helper for request ${requestId}: ${rating}`
-    );
-    io.to(`mechanic_${userId}`).emit("ride:rating-received", {
-      requestId,
-      rating,
-    });
-  });
+  // REMOVED "user:rate-helper" logic from here because it's now
+  // correctly handled by the userRateHelper Controller via REST API.
 
   /* ========== HELPER OFFLINE ========== */
   socket.on("mechanic:offline", async () => {
     onlineMechanics.delete(userId);
-    socket.leave("helpers_room");
     await AppDataSource.getRepository(User).update(
       { id: userId },
       { isOnline: false }
@@ -154,10 +156,23 @@ io.on("connection", (socket: Socket) => {
     emitMechanics();
     console.log(`🔴 Mechanic ${userId} offline`);
   });
-
+  // Add this inside the io.on("connection") block in index.ts
+  socket.on("mechanic:get-stats", async () => {
+    const userRepo = AppDataSource.getRepository(User);
+    const helper = await userRepo.findOne({ where: { id: userId } });
+    if (helper) {
+      socket.emit("stats:update", {
+        rating: helper.rating || 0,
+        earnings: helper.totalEarnings || 0,
+        count: helper.ratingCount || 0,
+      });
+    }
+  });
   /* ========== DISCONNECT ========== */
   socket.on("disconnect", async () => {
     onlineMechanics.delete(userId);
+    // Don't necessarily mark offline on disconnect to handle brief network drops,
+    // but for this implementation, we keep it consistent.
     await AppDataSource.getRepository(User).update(
       { id: userId },
       { isOnline: false }
