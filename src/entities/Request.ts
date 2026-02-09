@@ -1,4 +1,3 @@
-// src/entities/Request.ts
 import {
   Entity,
   PrimaryGeneratedColumn,
@@ -11,13 +10,12 @@ import {
 import { User } from "./User";
 import { Offer } from "./Offer";
 
-// ✅ Extended request status type
 export type RequestStatus =
   | "pending"
   | "accepted"
-  | "arrived" // helper reached user
-  | "working" // helper started work
-  | "completed" // work done
+  | "arrived"
+  | "working"
+  | "completed"
   | "cancelled";
 
 @Entity("requests")
@@ -59,7 +57,7 @@ export class Request {
   suggestedPrice?: number;
 
   // Assigned helper once accepted
-  @ManyToOne(() => User, { nullable: true })
+  @ManyToOne(() => User, { nullable: true, eager: true })
   helper?: User;
 
   // Offers from mechanics

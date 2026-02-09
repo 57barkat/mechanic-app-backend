@@ -8,6 +8,7 @@ import {
   helperStartWork,
   helperWorkDone,
   userRateHelper,
+  cancelRide, // ✅ Import the new cancelRide function
 } from "../controllers/request.controller";
 
 const router = Router();
@@ -36,5 +37,8 @@ router.post("/helper/done", authMiddleware, helperWorkDone);
 
 // User rates helper after work is completed
 router.post("/user/rate", authMiddleware, userRateHelper);
+
+// ===== CANCEL RIDE =====
+router.post("/cancel", authMiddleware, cancelRide); // ✅ New route
 
 export default router;

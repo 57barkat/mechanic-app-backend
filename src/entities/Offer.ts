@@ -1,4 +1,3 @@
-// src/entities/Offer.ts
 import {
   Entity,
   PrimaryGeneratedColumn,

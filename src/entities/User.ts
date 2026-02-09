@@ -11,6 +11,7 @@ import { Request } from "./Request";
 export enum UserRole {
   USER = "user",
   HELPER = "helper",
+  ADMIN = "admin",
 }
 
 export enum HelperCategory {
@@ -45,6 +46,9 @@ export class User {
 
   @Column({ type: "boolean", default: false })
   isOnline!: boolean;
+
+  @Column({ type: "boolean", default: false })
+  isBusy!: boolean; // New: true if currently on ride
 
   /* ======================
      ROLE MANAGEMENT
@@ -92,7 +96,8 @@ export class User {
   rating!: number;
 
   @Column({ type: "int", default: 0 })
-  ratingCount!: number; // Total number of people who rated them
+  ratingCount!: number;
+
   /* ======================
      RELATIONS
   ====================== */
