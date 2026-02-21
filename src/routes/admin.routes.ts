@@ -4,6 +4,7 @@ import { User, UserRole } from "../entities/User";
 import { Request as JobRequest } from "../entities/Request";
 import { adminAuth } from "../middlewares/adminAuth.middleware";
 import { adminLogin } from "../controllers/adminAuth.controller";
+import { AppSetting } from "../entities/AppSetting";
 
 const router = Router();
 
@@ -168,6 +169,50 @@ router.patch("/helpers/:id/verify", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+router.get("/commission", async (req, res) => {
+  try {
+    const repo = AppDataSource.getRepository(AppSetting);
+
+    const setting = await repo.findOneBy({ key: "commission_percent" });
+
+    return res.json({
+      commission: setting ? Number(setting.value) : 0,
+    });
+  } catch (err) {
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+router.put("/commission", async (req, res) => {
+  try {
+    const { percent } = req.body;
+
+    if (typeof percent !== "number" || percent < 0 || percent > 100) {
+      return res.status(400).json({ message: "Invalid commission percent" });
+    }
+
+    const repo = AppDataSource.getRepository(AppSetting);
+
+    let setting = await repo.findOneBy({ key: "commission_percent" });
+
+    if (!setting) {
+      setting = repo.create({
+        key: "commission_percent",
+        value: percent.toString(),
+      });
+    } else {
+      setting.value = percent.toString();
+    }
+
+    await repo.save(setting);
+
+    return res.json({
+      message: "Commission updated",
+      commission: percent,
+    });
+  } catch (err) {
     return res.status(500).json({ message: "Server error" });
   }
 });

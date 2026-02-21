@@ -103,6 +103,23 @@ export class User {
   ====================== */
   @OneToMany(() => Request, (request) => request.user)
   requests!: Request[];
+  @Column("double precision", {
+    default: 0,
+    transformer: {
+      to: (value: number) => value,
+      from: (value: string) => parseFloat(value) || 0,
+    },
+  })
+  availableBalance!: number;
+
+  @Column("double precision", {
+    default: 0,
+    transformer: {
+      to: (value: number) => value,
+      from: (value: string) => parseFloat(value) || 0,
+    },
+  })
+  pendingBalance!: number;
 
   /* ======================
      TIMESTAMPS

@@ -40,7 +40,7 @@ interface OnlineMechanic {
   lng: number | null;
 }
 
-const onlineMechanics = new Map<number, OnlineMechanic>();
+export const onlineMechanics = new Map<number, OnlineMechanic>();
 
 let lastEmitTime = 0;
 const EMIT_INTERVAL = 5000;
@@ -58,7 +58,7 @@ const emitMechanicsThrottled = () => {
 
 const performEmit = () => {
   const list = Array.from(onlineMechanics.values()).filter(
-    (m) => m.lat !== null && m.lng !== null
+    (m) => m.lat !== null && m.lng !== null,
   );
   io.emit("mechanics:update", list);
   lastEmitTime = Date.now();
@@ -74,7 +74,7 @@ io.use(async (socket: Socket, next) => {
     if (!token) return next(new Error("No token"));
     const payload: any = jwt.verify(
       token,
-      process.env.JWT_SECRET || "fallback_secret"
+      process.env.JWT_SECRET || "fallback_secret",
     );
     (socket as any).userId = payload.id;
     next();
@@ -112,7 +112,7 @@ io.on("connection", async (socket: Socket) => {
   }
 
   const currentList = Array.from(onlineMechanics.values()).filter(
-    (m) => m.lat && m.lng
+    (m) => m.lat && m.lng,
   );
   socket.emit("mechanics:update", currentList);
 
@@ -123,6 +123,7 @@ io.on("connection", async (socket: Socket) => {
       lat: null,
       lng: null,
     });
+
     await userRepo.update({ id: userId }, { isOnline: true });
 
     const helperProfile = await userRepo.findOneBy({ id: userId });
@@ -131,8 +132,34 @@ io.on("connection", async (socket: Socket) => {
         rating: helperProfile.rating || 0,
         earnings: helperProfile.totalEarnings || 0,
         count: helperProfile.ratingCount || 0,
+        commission: helperProfile.pendingBalance || 0,
       });
     }
+
+    const pendingRequests = await requestRepo.find({
+      where: { status: "pending" },
+      relations: ["user"],
+      order: { createdAt: "DESC" },
+      take: 10,
+    });
+
+    for (const req of pendingRequests) {
+      const mechUser = await userRepo.findOneBy({ id: userId });
+      if (!mechUser || mechUser.isBusy) continue;
+
+      socket.emit("request:new", {
+        requestId: req.id,
+        userId: req.user.id,
+        userName: req.user.name,
+        problemType: req.problemType,
+        description: req.description,
+        lat: req.lat,
+        lng: req.lng,
+        suggestedPrice: req.suggestedPrice,
+        status: req.status || "pending",
+      });
+    }
+
     performEmit();
   });
 
@@ -167,6 +194,8 @@ io.on("connection", async (socket: Socket) => {
       requestId,
       cancelledBy: userId,
     });
+
+    io.emit("request:unavailable", { requestId });
 
     io.in(`request_${requestId}`).socketsLeave(`request_${requestId}`);
   });

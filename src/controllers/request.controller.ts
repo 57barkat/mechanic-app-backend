@@ -3,9 +3,10 @@ import { AppDataSource } from "../config/db";
 import { User, UserRole } from "../entities/User";
 import { Request as JobRequest } from "../entities/Request";
 import { Offer } from "../entities/Offer";
-import { io } from "../index";
+import { io, onlineMechanics } from "../index";
 import { getDistance } from "geolib";
 import { Not, IsNull } from "typeorm";
+import { AppSetting } from "../entities/AppSetting";
 
 interface AuthRequest extends ExRequest {
   user?: User;
@@ -40,8 +41,8 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       const distances = onlineHelpers.map((h) =>
         getDistance(
           { latitude: lat, longitude: lng },
-          { latitude: h.lat!, longitude: h.lng! }
-        )
+          { latitude: h.lat!, longitude: h.lng! },
+        ),
       );
       const nearestDistanceKm = Math.min(...distances) / 1000;
       suggestedPrice += nearestDistanceKm * 50;
@@ -59,16 +60,21 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
 
     await requestRepo.save(newRequest);
 
-    io.emit("request:new", {
-      requestId: newRequest.id,
-      userId: user.id,
-      userName: user.name,
-      problemType,
-      description,
-      lat,
-      lng,
-      suggestedPrice,
-    });
+    for (const mechanic of onlineMechanics.values()) {
+      const mechUser = await userRepo.findOneBy({ id: mechanic.userId });
+      if (!mechUser || mechUser.isBusy) continue;
+
+      io.to(mechanic.socketId).emit("request:new", {
+        requestId: newRequest.id,
+        userId: user.id,
+        userName: user.name,
+        problemType,
+        description,
+        lat,
+        lng,
+        suggestedPrice,
+      });
+    }
 
     return res.status(201).json({
       message: "Request created",
@@ -122,7 +128,7 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
       mechanic.lat && mechanic.lng
         ? getDistance(
             { latitude: mechanic.lat, longitude: mechanic.lng },
-            { latitude: request.lat, longitude: request.lng }
+            { latitude: request.lat, longitude: request.lng },
           ) / 1000
         : null;
 
@@ -186,12 +192,18 @@ export const acceptOffer = async (req: AuthRequest, res: Response) => {
       requestId: request.id,
       userLocation: { lat: request.lat, lng: request.lng },
       helperLocation: { lat: offer.mechanic.lat, lng: offer.mechanic.lng },
+      offeredPrice: offer.offeredPrice,
     };
 
     io.to(`user_${user.id}`).emit("ride:started", navigationData);
     io.to(`mechanic_${offer.mechanic.id}`).emit("ride:started", navigationData);
 
-    return res.json({ message: "Offer accepted", requestId: request.id });
+    // FIXED: Returning exact structure frontend expects
+    return res.json({
+      message: "Offer accepted",
+      request: { id: request.id },
+      navigationData: navigationData,
+    });
   } catch {
     return res.status(500).json({ message: "Server error" });
   }
@@ -254,52 +266,118 @@ export const helperStartWork = async (req: AuthRequest, res: Response) => {
 };
 
 export const helperWorkDone = async (req: AuthRequest, res: Response) => {
+  const queryRunner = AppDataSource.createQueryRunner();
+  console.log("==== helperWorkDone START ====");
+
+  await queryRunner.connect();
+  await queryRunner.startTransaction();
+
   try {
     const { requestId, finalPrice } = req.body;
     const helperUser = req.user as User;
+    const totalAmount = parseFloat(finalPrice);
 
-    const requestRepo = AppDataSource.getRepository(JobRequest);
-    const userRepo = AppDataSource.getRepository(User);
+    if (!requestId || isNaN(totalAmount) || totalAmount <= 0) {
+      return res.status(400).json({ message: "Invalid final price" });
+    }
+
+    const requestRepo = queryRunner.manager.getRepository(JobRequest);
+    const userRepo = queryRunner.manager.getRepository(User);
+    const settingRepo = queryRunner.manager.getRepository(AppSetting);
 
     const request = await requestRepo.findOne({
       where: { id: requestId },
-      relations: ["user", "helper"],
+      relations: ["user", "helper", "offers"],
     });
 
-    if (!request || !ACTIVE_STATUSES.includes(request.status))
-      return res.status(400).json({ message: "Request not active" });
+    if (!request) {
+      return res.status(404).json({ message: "Request not found" });
+    }
 
-    if (request.helper?.id !== helperUser.id)
+    if (totalAmount < (request?.suggestedPrice || 0)) {
+      return res.status(400).json({
+        message: `Price cannot be lower than Rs ${request.suggestedPrice}`,
+      });
+    }
+
+    if (!ACTIVE_STATUSES.includes(request.status)) {
+      return res.status(400).json({ message: "Request not active" });
+    }
+
+    if (request.helper?.id !== helperUser.id) {
       return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const commissionSetting = await settingRepo.findOneBy({
+      key: "commission_percent",
+    });
+
+    let commissionPercent = 0;
+    if (commissionSetting?.value) {
+      commissionPercent =
+        parseFloat(
+          commissionSetting.value.toString().replace("%", "").trim(),
+        ) || 0;
+    }
+
+    const commissionAmount = (totalAmount * commissionPercent) / 100;
+    const mechanicEarning = totalAmount - commissionAmount;
 
     request.status = "completed";
-    request.finalPrice = finalPrice;
+    request.finalPrice = totalAmount;
     await requestRepo.save(request);
-
-    await userRepo.update({ id: helperUser.id }, { isBusy: false });
 
     const helperProfile = await userRepo.findOne({
       where: { id: helperUser.id },
     });
-    if (helperProfile) {
-      helperProfile.totalEarnings += Number(finalPrice);
-      await userRepo.save(helperProfile);
-      io.to(`mechanic_${helperProfile.id}`).emit("stats:update", {
-        earnings: helperProfile.totalEarnings,
-        rating: helperProfile.rating,
-        count: helperProfile.ratingCount,
-      });
+
+    if (!helperProfile) {
+      return res.status(404).json({ message: "Helper not found" });
     }
 
+    helperProfile.totalEarnings =
+      (Number(helperProfile.totalEarnings) || 0) + mechanicEarning;
+    helperProfile.availableBalance =
+      (Number(helperProfile.availableBalance) || 0) + mechanicEarning;
+    helperProfile.pendingBalance =
+      (Number(helperProfile.pendingBalance) || 0) + commissionAmount;
+    helperProfile.isBusy = false;
+
+    await userRepo.save(helperProfile);
+
+    // COMMIT FIRST
+    await queryRunner.commitTransaction();
+
+    // === RESTORED SOCKET EVENTS ===
+
+    // 1. Notify the User (Triggers the Rating Screen)
     io.to(`user_${request.user.id}`).emit("helper:completed", {
       requestId,
-      finalPrice,
+      finalPrice: totalAmount,
     });
-    io.in(`request_${request.id}`).socketsLeave(`request_${request.id}`);
 
-    return res.json({ message: "Completed" });
-  } catch {
-    return res.status(500).json({ message: "Server error" });
+    // 2. Update Helper's Stats (Live updates their earnings/rating)
+    io.to(`mechanic_${helperProfile.id}`).emit("stats:update", {
+      earnings: helperProfile.totalEarnings,
+      rating: helperProfile.rating,
+      count: helperProfile.ratingCount,
+      commission: helperProfile.pendingBalance, // Useful to keep this updated too
+    });
+
+    // 3. Clean up the room
+    io.in(`request_${request.id}`).socketsLeave(`request_${request.id}`);
+    // ===============================
+
+    return res.json({ message: "Completed successfully" });
+  } catch (err: any) {
+    await queryRunner.rollbackTransaction();
+    return res.status(500).json({
+      message: "Server error",
+      error: err?.message,
+    });
+  } finally {
+    await queryRunner.release();
+    console.log("==== helperWorkDone END ====");
   }
 };
 
@@ -327,6 +405,8 @@ export const cancelRide = async (req: AuthRequest, res: Response) => {
     request.status = "cancelled";
     await requestRepo.save(request);
 
+    io.emit("request:unavailable", { requestId: request.id });
+
     if (request.helper)
       await userRepo.update({ id: request.helper.id }, { isBusy: false });
 
@@ -344,6 +424,7 @@ export const cancelRide = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ message: "Server error" });
   }
 };
+
 export const userRateHelper = async (req: AuthRequest, res: Response) => {
   try {
     const { requestId, rating } = req.body;
