@@ -8,7 +8,7 @@ import { In } from "typeorm";
 import { AppDataSource } from "./config/db";
 import authRoutes from "./routes/auth.routes";
 import requestRoutes from "./routes/request.routes";
-import { User } from "./entities/User";
+import { User, UserRole } from "./entities/User";
 import { Request as JobRequest } from "./entities/Request";
 
 dotenv.config();
@@ -31,6 +31,8 @@ const server = http.createServer(app);
 export const io = new Server(server, {
   path: "/socket.io",
   cors: { origin: "*", methods: ["GET", "POST"] },
+  pingInterval: 25000,
+  pingTimeout: 60000,
 });
 
 interface OnlineMechanic {
@@ -111,22 +113,38 @@ io.on("connection", async (socket: Socket) => {
     socket.join(`request_${activeReq.id}`);
   }
 
-  const currentList = Array.from(onlineMechanics.values()).filter(
-    (m) => m.lat && m.lng,
-  );
-  socket.emit("mechanics:update", currentList);
-
-  socket.on("mechanic:online", async () => {
+  /**
+   * 🔥 CRITICAL FIX:
+   * If helper reconnects and DB says he is online,
+   * re-register him inside memory map.
+   */
+  if (
+    dbUser?.role === UserRole.HELPER &&
+    dbUser.isOnline &&
+    !onlineMechanics.has(userId)
+  ) {
     onlineMechanics.set(userId, {
       socketId: socket.id,
       userId,
-      lat: null,
-      lng: null,
+      lat: dbUser.lat || null,
+      lng: dbUser.lng || null,
     });
 
-    await userRepo.update({ id: userId }, { isOnline: true });
+    performEmit();
+  }
+
+  socket.on("mechanic:online", async () => {
+    await userRepo.update({ id: userId }, { isOnline: true, isBusy: false });
 
     const helperProfile = await userRepo.findOneBy({ id: userId });
+
+    onlineMechanics.set(userId, {
+      socketId: socket.id,
+      userId,
+      lat: helperProfile?.lat || null,
+      lng: helperProfile?.lng || null,
+    });
+
     if (helperProfile) {
       socket.emit("stats:update", {
         rating: helperProfile.rating || 0,
@@ -144,9 +162,6 @@ io.on("connection", async (socket: Socket) => {
     });
 
     for (const req of pendingRequests) {
-      const mechUser = await userRepo.findOneBy({ id: userId });
-      if (!mechUser || mechUser.isBusy) continue;
-
       socket.emit("request:new", {
         requestId: req.id,
         userId: req.user.id,
@@ -174,8 +189,23 @@ io.on("connection", async (socket: Socket) => {
   });
 
   socket.on("mechanic:offline", async () => {
+    const helper = await userRepo.findOneBy({ id: userId });
+    if (helper) {
+      const pending = Number(helper.pendingBalance) || 0;
+      const available = Number(helper.availableBalance) || 0;
+
+      await userRepo.update(
+        { id: userId },
+        {
+          isOnline: false,
+          isBusy: false,
+          availableBalance: available + pending,
+          pendingBalance: 0,
+        },
+      );
+    }
+
     onlineMechanics.delete(userId);
-    await userRepo.update({ id: userId }, { isOnline: false });
     performEmit();
   });
 
@@ -196,11 +226,20 @@ io.on("connection", async (socket: Socket) => {
     });
 
     io.emit("request:unavailable", { requestId });
-
     io.in(`request_${requestId}`).socketsLeave(`request_${requestId}`);
   });
 
-  socket.on("disconnect", () => {});
+  /**
+   * 🔥 FIXED DISCONNECT HANDLER
+   * Keeps DB and memory synced.
+   */
+  socket.on("disconnect", async () => {
+    if (onlineMechanics.has(userId)) {
+      onlineMechanics.delete(userId);
+      await userRepo.update({ id: userId }, { isOnline: false });
+      performEmit();
+    }
+  });
 });
 
 const PORT = process.env.PORT || 3000;

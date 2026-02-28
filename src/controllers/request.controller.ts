@@ -5,7 +5,7 @@ import { Request as JobRequest } from "../entities/Request";
 import { Offer } from "../entities/Offer";
 import { io, onlineMechanics } from "../index";
 import { getDistance } from "geolib";
-import { Not, IsNull } from "typeorm";
+import { Not, IsNull, In } from "typeorm";
 import { AppSetting } from "../entities/AppSetting";
 
 interface AuthRequest extends ExRequest {
@@ -25,6 +25,13 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
 
     const requestRepo = AppDataSource.getRepository(JobRequest);
     const userRepo = AppDataSource.getRepository(User);
+
+    await requestRepo.update(
+      { user: { id: user.id }, status: In(["pending", "accepted"]) },
+      { status: "cancelled" },
+    );
+
+    io.to(`user_${user.id}`).emit("request:cleared_previous");
 
     const onlineHelpers = await userRepo.find({
       where: {
@@ -47,6 +54,8 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       const nearestDistanceKm = Math.min(...distances) / 1000;
       suggestedPrice += nearestDistanceKm * 50;
     }
+
+    suggestedPrice = Math.round(suggestedPrice);
 
     const newRequest = requestRepo.create({
       user,
@@ -124,7 +133,7 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
     if (existingOffer)
       return res.status(400).json({ message: "Offer already sent" });
 
-    const distanceKm =
+    const rawDistance =
       mechanic.lat && mechanic.lng
         ? getDistance(
             { latitude: mechanic.lat, longitude: mechanic.lng },
@@ -132,14 +141,21 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
           ) / 1000
         : null;
 
-    const offer = offerRepo.create({ mechanic, request, offeredPrice });
+    const distanceKm = rawDistance ? parseFloat(rawDistance.toFixed(2)) : null;
+    const finalOfferedPrice = Math.round(offeredPrice);
+
+    const offer = offerRepo.create({
+      mechanic,
+      request,
+      offeredPrice: finalOfferedPrice,
+    });
     await offerRepo.save(offer);
 
     io.to(`user_${request.user.id}`).emit("offer:new", {
       id: offer.id,
       requestId: request.id,
-      offeredPrice,
-      distanceKm: distanceKm ? Number(distanceKm.toFixed(2)) : null,
+      offeredPrice: finalOfferedPrice,
+      distanceKm,
       helper: {
         userId: mechanic.id,
         name: mechanic.name,
@@ -192,13 +208,12 @@ export const acceptOffer = async (req: AuthRequest, res: Response) => {
       requestId: request.id,
       userLocation: { lat: request.lat, lng: request.lng },
       helperLocation: { lat: offer.mechanic.lat, lng: offer.mechanic.lng },
-      offeredPrice: offer.offeredPrice,
+      offeredPrice: Math.round(offer.offeredPrice),
     };
 
     io.to(`user_${user.id}`).emit("ride:started", navigationData);
     io.to(`mechanic_${offer.mechanic.id}`).emit("ride:started", navigationData);
 
-    // FIXED: Returning exact structure frontend expects
     return res.json({
       message: "Offer accepted",
       request: { id: request.id },
@@ -267,17 +282,16 @@ export const helperStartWork = async (req: AuthRequest, res: Response) => {
 
 export const helperWorkDone = async (req: AuthRequest, res: Response) => {
   const queryRunner = AppDataSource.createQueryRunner();
-  console.log("==== helperWorkDone START ====");
-
   await queryRunner.connect();
   await queryRunner.startTransaction();
 
   try {
     const { requestId, finalPrice } = req.body;
     const helperUser = req.user as User;
-    const totalAmount = parseFloat(finalPrice);
+    const totalAmount = Math.round(parseFloat(finalPrice));
 
     if (!requestId || isNaN(totalAmount) || totalAmount <= 0) {
+      await queryRunner.rollbackTransaction();
       return res.status(400).json({ message: "Invalid final price" });
     }
 
@@ -287,24 +301,21 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
 
     const request = await requestRepo.findOne({
       where: { id: requestId },
-      relations: ["user", "helper", "offers"],
+      relations: ["user", "helper"],
     });
 
     if (!request) {
+      await queryRunner.rollbackTransaction();
       return res.status(404).json({ message: "Request not found" });
     }
 
-    if (totalAmount < (request?.suggestedPrice || 0)) {
-      return res.status(400).json({
-        message: `Price cannot be lower than Rs ${request.suggestedPrice}`,
-      });
-    }
-
     if (!ACTIVE_STATUSES.includes(request.status)) {
+      await queryRunner.rollbackTransaction();
       return res.status(400).json({ message: "Request not active" });
     }
 
     if (request.helper?.id !== helperUser.id) {
+      await queryRunner.rollbackTransaction();
       return res.status(403).json({ message: "Forbidden" });
     }
 
@@ -313,18 +324,19 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
     });
 
     let commissionPercent = 0;
+
     if (commissionSetting?.value) {
-      commissionPercent =
-        parseFloat(
-          commissionSetting.value.toString().replace("%", "").trim(),
-        ) || 0;
+      commissionPercent = parseFloat(commissionSetting.value.toString()) || 0;
     }
 
-    const commissionAmount = (totalAmount * commissionPercent) / 100;
-    const mechanicEarning = totalAmount - commissionAmount;
+    // ✅ Calculate commission (platform share)
+    const commissionAmount = parseFloat(
+      ((totalAmount * commissionPercent) / 100).toFixed(2),
+    );
 
     request.status = "completed";
     request.finalPrice = totalAmount;
+
     await requestRepo.save(request);
 
     const helperProfile = await userRepo.findOne({
@@ -332,52 +344,56 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
     });
 
     if (!helperProfile) {
+      await queryRunner.rollbackTransaction();
       return res.status(404).json({ message: "Helper not found" });
     }
 
-    helperProfile.totalEarnings =
-      (Number(helperProfile.totalEarnings) || 0) + mechanicEarning;
-    helperProfile.availableBalance =
-      (Number(helperProfile.availableBalance) || 0) + mechanicEarning;
-    helperProfile.pendingBalance =
-      (Number(helperProfile.pendingBalance) || 0) + commissionAmount;
+    // ✅ Helper earned full amount
+    helperProfile.totalEarnings = parseFloat(
+      ((Number(helperProfile.totalEarnings) || 0) + totalAmount).toFixed(2),
+    );
+
+    // ✅ Pending balance stores commission only
+    helperProfile.pendingBalance = parseFloat(
+      ((Number(helperProfile.pendingBalance) || 0) + commissionAmount).toFixed(
+        2,
+      ),
+    );
+
     helperProfile.isBusy = false;
 
     await userRepo.save(helperProfile);
 
-    // COMMIT FIRST
     await queryRunner.commitTransaction();
 
-    // === RESTORED SOCKET EVENTS ===
-
-    // 1. Notify the User (Triggers the Rating Screen)
     io.to(`user_${request.user.id}`).emit("helper:completed", {
       requestId,
       finalPrice: totalAmount,
     });
 
-    // 2. Update Helper's Stats (Live updates their earnings/rating)
     io.to(`mechanic_${helperProfile.id}`).emit("stats:update", {
       earnings: helperProfile.totalEarnings,
       rating: helperProfile.rating,
       count: helperProfile.ratingCount,
-      commission: helperProfile.pendingBalance, // Useful to keep this updated too
+      pendingBalance: helperProfile.pendingBalance,
+      availableBalance: helperProfile.availableBalance,
+      commissionAmount,
     });
 
-    // 3. Clean up the room
-    io.in(`request_${request.id}`).socketsLeave(`request_${request.id}`);
-    // ===============================
-
-    return res.json({ message: "Completed successfully" });
+    return res.json({
+      message: "Completed successfully",
+      data: {
+        finalPrice: totalAmount,
+        commissionPercent,
+        commissionAmount,
+        helperEarned: totalAmount,
+      },
+    });
   } catch (err: any) {
     await queryRunner.rollbackTransaction();
-    return res.status(500).json({
-      message: "Server error",
-      error: err?.message,
-    });
+    return res.status(500).json({ message: "Server error" });
   } finally {
     await queryRunner.release();
-    console.log("==== helperWorkDone END ====");
   }
 };
 
@@ -417,8 +433,6 @@ export const cancelRide = async (req: AuthRequest, res: Response) => {
         requestId,
       });
 
-    io.in(`request_${request.id}`).socketsLeave(`request_${request.id}`);
-
     return res.json({ message: "Ride cancelled" });
   } catch {
     return res.status(500).json({ message: "Server error" });
@@ -442,18 +456,16 @@ export const userRateHelper = async (req: AuthRequest, res: Response) => {
     if (request.rating)
       return res.status(400).json({ message: "Already rated" });
 
-    request.rating = Number(rating);
+    request.rating = Math.round(Number(rating));
     await requestRepo.save(request);
 
     if (request.helper) {
       const helper = request.helper;
       const currentRating = Number(helper.rating) || 0;
       const currentCount = Number(helper.ratingCount) || 0;
-      const newRatingInput = Number(rating);
-
       const newCount = currentCount + 1;
       const newAverage =
-        (currentRating * currentCount + newRatingInput) / newCount;
+        (currentRating * currentCount + Number(rating)) / newCount;
 
       helper.rating = parseFloat(newAverage.toFixed(2));
       helper.ratingCount = newCount;
@@ -463,12 +475,12 @@ export const userRateHelper = async (req: AuthRequest, res: Response) => {
         rating: helper.rating,
         earnings: helper.totalEarnings,
         count: helper.ratingCount,
+        commission: helper.pendingBalance,
       });
     }
 
     return res.json({ message: "Rating saved" });
-  } catch (err) {
-    console.error(err);
+  } catch {
     return res.status(500).json({ message: "Server error" });
   }
 };
