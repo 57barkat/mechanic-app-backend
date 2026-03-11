@@ -1,4 +1,3 @@
-// src/controllers/auth.controller.ts
 import { Request, Response } from "express";
 import { AppDataSource } from "../config/db";
 import { User, UserRole, HelperCategory } from "../entities/User";
@@ -86,7 +85,7 @@ export const loginUser = async (req: Request, res: Response) => {
         role: user.role,
       },
       process.env.JWT_SECRET!,
-      { expiresIn: "7d" }
+      { expiresIn: "7d" },
     );
 
     console.log("✅ User logged in:", user.id, user.role);

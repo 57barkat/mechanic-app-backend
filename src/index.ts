@@ -87,6 +87,13 @@ io.use(async (socket: Socket, next) => {
 
 io.on("connection", async (socket: Socket) => {
   const userId = (socket as any).userId;
+  console.log(`[SOCKET] User ${userId} connected on socket ${socket.id}`);
+
+  // FIX: Force previous connections for this user to leave rooms to prevent "Double Connection Leak"
+  const userRooms = Array.from(socket.rooms);
+  userRooms.forEach((room) => {
+    if (room.startsWith("request_")) socket.leave(room);
+  });
 
   socket.join(`user_${userId}`);
   socket.join(`mechanic_${userId}`);
@@ -102,6 +109,13 @@ io.on("connection", async (socket: Socket) => {
       { helper: { id: userId }, status: In(ACTIVE_STATUSES) },
     ],
   });
+
+  if (activeReq) {
+    console.log(
+      `[SOCKET] Active request found (ID: ${activeReq.id}). User ${userId} joining request_${activeReq.id}`,
+    );
+    socket.join(`request_${activeReq.id}`);
+  }
 
   socket.emit("ride:sync", {
     isOnline: dbUser?.isOnline || false,

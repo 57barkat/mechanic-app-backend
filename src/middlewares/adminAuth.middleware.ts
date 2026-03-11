@@ -10,7 +10,7 @@ interface AdminRequest extends Request {
 export const adminAuth = async (
   req: AdminRequest,
   res: Response,
-  next: NextFunction
+  next: NextFunction,
 ) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
