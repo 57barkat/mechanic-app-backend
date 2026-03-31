@@ -25,6 +25,7 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
 
     const requestRepo = AppDataSource.getRepository(JobRequest);
     const userRepo = AppDataSource.getRepository(User);
+    const offerRepo = AppDataSource.getRepository(Offer); // Needed for timeout cleanup
 
     await requestRepo.update(
       { user: { id: user.id }, status: In(["pending", "accepted"]) },
@@ -86,6 +87,42 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       });
     }
 
+    // --- PRO TIMEOUT LOGIC START ---
+    // Start a 5-minute timer to auto-cancel if no one accepts
+    setTimeout(
+      async () => {
+        try {
+          const checkReq = await requestRepo.findOne({
+            where: { id: newRequest.id },
+            relations: ["user", "helper"],
+          });
+
+          // Check if the request is still pending and has no helper assigned
+          if (checkReq && checkReq.status === "pending" && !checkReq.helper) {
+            checkReq.status = "cancelled";
+            await requestRepo.save(checkReq);
+
+            // Delete any bids/offers sent by mechanics for this dead request
+            await offerRepo.delete({ request: { id: checkReq.id } });
+
+            // Notify the app/frontend that this request is now gone
+            io.emit("request:unavailable", { requestId: checkReq.id });
+            io.to(`user_${checkReq.user.id}`).emit("ride:cancelled", {
+              requestId: checkReq.id,
+              reason: "timeout",
+            });
+
+            console.log(
+              `⏱️ Auto-cancelled request ${checkReq.id} (No response in 5 mins)`,
+            );
+          }
+        } catch (timeoutErr) {
+          console.error("Error in request timeout check:", timeoutErr);
+        }
+      },
+      5 * 60 * 1000,
+    );
+
     return res.status(201).json({
       message: "Request created",
       request: {
@@ -102,6 +139,7 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       },
     });
   } catch (err) {
+    console.error("Create Request Error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 };
