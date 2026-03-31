@@ -16,7 +16,7 @@ const ACTIVE_STATUSES = ["pending", "accepted", "arrived", "working"];
 
 export const createRequest = async (req: AuthRequest, res: Response) => {
   try {
-    const { problemType, lat, lng, description } = req.body;
+    const { problemType, lat, lng, description, areaName } = req.body;
     const user = req.user as User;
 
     if (!lat || !lng || !problemType || !description) {
@@ -61,6 +61,7 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       user,
       problemType,
       description,
+      areaName,
       lat,
       lng,
       status: "pending",
@@ -70,8 +71,7 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
     await requestRepo.save(newRequest);
 
     for (const mechanic of onlineMechanics.values()) {
-      const mechUser = await userRepo.findOneBy({ id: mechanic.userId });
-      if (!mechUser || mechUser.isBusy) continue;
+      if (mechanic.isBusy) continue;
 
       io.to(mechanic.socketId).emit("request:new", {
         requestId: newRequest.id,
@@ -79,6 +79,7 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
         userName: user.name,
         problemType,
         description,
+        areaName,
         lat,
         lng,
         suggestedPrice,
@@ -93,6 +94,7 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
         userName: user.name,
         problemType,
         description,
+        areaName,
         lat,
         lng,
         suggestedPrice,
@@ -121,17 +123,20 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
       relations: ["user"],
     });
 
-    if (!request || !ACTIVE_STATUSES.includes(request.status))
+    if (!request || !ACTIVE_STATUSES.includes(request.status)) {
       return res.status(400).json({ message: "Request not active" });
+    }
 
-    if (request.helper)
+    if (request.helper) {
       return res.status(400).json({ message: "Request already accepted" });
+    }
 
     const existingOffer = await offerRepo.findOne({
       where: { request: { id: requestId }, mechanic: { id: mechanic.id } },
     });
-    if (existingOffer)
+    if (existingOffer) {
       return res.status(400).json({ message: "Offer already sent" });
+    }
 
     const rawDistance =
       mechanic.lat && mechanic.lng
@@ -167,7 +172,7 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
     });
 
     return res.json({ message: "Offer sent", offerId: offer.id });
-  } catch {
+  } catch (err) {
     return res.status(500).json({ message: "Server error" });
   }
 };
@@ -186,11 +191,13 @@ export const acceptOffer = async (req: AuthRequest, res: Response) => {
       relations: ["request", "request.user", "mechanic"],
     });
 
-    if (!offer || !ACTIVE_STATUSES.includes(offer.request.status))
-      return res.status(400).json({ message: "Request not active" });
+    if (!offer || offer.request.status !== "pending") {
+      return res.status(400).json({ message: "Request no longer available" });
+    }
 
-    if (offer.request.user.id !== user.id)
+    if (offer.request.user.id !== user.id) {
       return res.status(403).json({ message: "Forbidden" });
+    }
 
     offer.accepted = true;
     await offerRepo.save(offer);
@@ -200,7 +207,18 @@ export const acceptOffer = async (req: AuthRequest, res: Response) => {
     request.helper = offer.mechanic;
     await requestRepo.save(request);
 
+    // Sync Memory Map: Flag mechanic as busy so they disappear from map for others
+    const mechInMemory = onlineMechanics.get(offer.mechanic.id);
+    if (mechInMemory) {
+      mechInMemory.isBusy = true;
+    }
+
     await userRepo.update({ id: offer.mechanic.id }, { isBusy: true });
+
+    await offerRepo.delete({
+      request: { id: request.id },
+      accepted: false,
+    });
 
     io.emit("request:unavailable", { requestId: request.id });
 
@@ -209,17 +227,25 @@ export const acceptOffer = async (req: AuthRequest, res: Response) => {
       userLocation: { lat: request.lat, lng: request.lng },
       helperLocation: { lat: offer.mechanic.lat, lng: offer.mechanic.lng },
       offeredPrice: Math.round(offer.offeredPrice),
+      helperName: offer.mechanic.name,
     };
 
+    io.to(`user_${user.id}`).emit("offers:clear", { requestId: request.id });
     io.to(`user_${user.id}`).emit("ride:started", navigationData);
     io.to(`mechanic_${offer.mechanic.id}`).emit("ride:started", navigationData);
+
+    // Trigger a global update so the accepted mechanic is removed from all users' maps
+    const activeList = Array.from(onlineMechanics.values()).filter(
+      (m) => !m.isBusy,
+    );
+    io.emit("mechanics:update", activeList);
 
     return res.json({
       message: "Offer accepted",
       request: { id: request.id },
       navigationData: navigationData,
     });
-  } catch {
+  } catch (err) {
     return res.status(500).json({ message: "Server error" });
   }
 };
@@ -235,11 +261,13 @@ export const helperArrived = async (req: AuthRequest, res: Response) => {
       relations: ["user", "helper"],
     });
 
-    if (!request || !ACTIVE_STATUSES.includes(request.status))
+    if (!request || !ACTIVE_STATUSES.includes(request.status)) {
       return res.status(400).json({ message: "Request not active" });
+    }
 
-    if (request.helper?.id !== helper.id)
+    if (request.helper?.id !== helper.id) {
       return res.status(403).json({ message: "Forbidden" });
+    }
 
     request.status = "arrived";
     await repo.save(request);
@@ -247,7 +275,7 @@ export const helperArrived = async (req: AuthRequest, res: Response) => {
     io.to(`user_${request.user.id}`).emit("helper:arrived", { requestId });
 
     return res.json({ message: "Arrived" });
-  } catch {
+  } catch (err) {
     return res.status(500).json({ message: "Server error" });
   }
 };
@@ -263,11 +291,13 @@ export const helperStartWork = async (req: AuthRequest, res: Response) => {
       relations: ["user", "helper"],
     });
 
-    if (!request || !ACTIVE_STATUSES.includes(request.status))
+    if (!request || !ACTIVE_STATUSES.includes(request.status)) {
       return res.status(400).json({ message: "Request not active" });
+    }
 
-    if (request.helper?.id !== helper.id)
+    if (request.helper?.id !== helper.id) {
       return res.status(403).json({ message: "Forbidden" });
+    }
 
     request.status = "working";
     await repo.save(request);
@@ -275,7 +305,7 @@ export const helperStartWork = async (req: AuthRequest, res: Response) => {
     io.to(`user_${request.user.id}`).emit("helper:working", { requestId });
 
     return res.json({ message: "Working" });
-  } catch {
+  } catch (err) {
     return res.status(500).json({ message: "Server error" });
   }
 };
@@ -304,12 +334,7 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
       relations: ["user", "helper"],
     });
 
-    if (!request) {
-      await queryRunner.rollbackTransaction();
-      return res.status(404).json({ message: "Request not found" });
-    }
-
-    if (!ACTIVE_STATUSES.includes(request.status)) {
+    if (!request || !ACTIVE_STATUSES.includes(request.status)) {
       await queryRunner.rollbackTransaction();
       return res.status(400).json({ message: "Request not active" });
     }
@@ -322,21 +347,17 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
     const commissionSetting = await settingRepo.findOneBy({
       key: "commission_percent",
     });
-
     let commissionPercent = 0;
-
     if (commissionSetting?.value) {
       commissionPercent = parseFloat(commissionSetting.value.toString()) || 0;
     }
 
-    // ✅ Calculate commission (platform share)
     const commissionAmount = parseFloat(
       ((totalAmount * commissionPercent) / 100).toFixed(2),
     );
 
     request.status = "completed";
     request.finalPrice = totalAmount;
-
     await requestRepo.save(request);
 
     const helperProfile = await userRepo.findOne({
@@ -348,21 +369,22 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: "Helper not found" });
     }
 
-    // ✅ Helper earned full amount
     helperProfile.totalEarnings = parseFloat(
       ((Number(helperProfile.totalEarnings) || 0) + totalAmount).toFixed(2),
     );
-
-    // ✅ Pending balance stores commission only
     helperProfile.pendingBalance = parseFloat(
       ((Number(helperProfile.pendingBalance) || 0) + commissionAmount).toFixed(
         2,
       ),
     );
-
     helperProfile.isBusy = false;
-
     await userRepo.save(helperProfile);
+
+    // Sync Memory Map: Free the mechanic
+    const mechInMemory = onlineMechanics.get(helperProfile.id);
+    if (mechInMemory) {
+      mechInMemory.isBusy = false;
+    }
 
     await queryRunner.commitTransaction();
 
@@ -370,7 +392,6 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
       requestId,
       finalPrice: totalAmount,
     });
-
     io.to(`mechanic_${helperProfile.id}`).emit("stats:update", {
       earnings: helperProfile.totalEarnings,
       rating: helperProfile.rating,
@@ -379,6 +400,12 @@ export const helperWorkDone = async (req: AuthRequest, res: Response) => {
       availableBalance: helperProfile.availableBalance,
       commissionAmount,
     });
+
+    // Notify other users that the mechanic is back on the map
+    const activeList = Array.from(onlineMechanics.values()).filter(
+      (m) => !m.isBusy,
+    );
+    io.emit("mechanics:update", activeList);
 
     return res.json({
       message: "Completed successfully",
@@ -410,31 +437,45 @@ export const cancelRide = async (req: AuthRequest, res: Response) => {
       relations: ["user", "helper"],
     });
 
-    if (!request || !ACTIVE_STATUSES.includes(request.status))
+    if (!request || !ACTIVE_STATUSES.includes(request.status)) {
       return res.status(400).json({ message: "Request not active" });
+    }
 
     const isUser = request.user.id === user.id;
     const isHelper = request.helper?.id === user.id;
-    if (!isUser && !isHelper)
+    if (!isUser && !isHelper) {
       return res.status(403).json({ message: "Forbidden" });
+    }
 
     request.status = "cancelled";
     await requestRepo.save(request);
 
     io.emit("request:unavailable", { requestId: request.id });
 
-    if (request.helper)
+    if (request.helper) {
       await userRepo.update({ id: request.helper.id }, { isBusy: false });
+      const mechInMemory = onlineMechanics.get(request.helper.id);
+      if (mechInMemory) {
+        mechInMemory.isBusy = false;
+      }
+    }
 
     io.to(`request_${request.id}`).emit("ride:cancelled", { requestId });
     io.to(`user_${request.user.id}`).emit("ride:cancelled", { requestId });
-    if (request.helper)
+    if (request.helper) {
       io.to(`mechanic_${request.helper.id}`).emit("ride:cancelled", {
         requestId,
       });
+    }
+
+    // Update map for everyone
+    const activeList = Array.from(onlineMechanics.values()).filter(
+      (m) => !m.isBusy,
+    );
+    io.emit("mechanics:update", activeList);
 
     return res.json({ message: "Ride cancelled" });
-  } catch {
+  } catch (err) {
     return res.status(500).json({ message: "Server error" });
   }
 };
@@ -452,9 +493,13 @@ export const userRateHelper = async (req: AuthRequest, res: Response) => {
       relations: ["helper", "user"],
     });
 
-    if (!request) return res.status(404).json({ message: "Request not found" });
-    if (request.rating)
+    if (!request) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    if (request.rating) {
       return res.status(400).json({ message: "Already rated" });
+    }
 
     request.rating = Math.round(Number(rating));
     await requestRepo.save(request);
@@ -480,7 +525,7 @@ export const userRateHelper = async (req: AuthRequest, res: Response) => {
     }
 
     return res.json({ message: "Rating saved" });
-  } catch {
+  } catch (err) {
     return res.status(500).json({ message: "Server error" });
   }
 };

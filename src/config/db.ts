@@ -1,9 +1,10 @@
-import { DataSource } from "typeorm";
+import { DataSource } from "typeorm"; // remove Transaction from here
 import { User } from "../entities/User";
-import { Request as JobRequest } from "../entities/Request"; // Aliased to avoid naming conflicts
+import { Request as JobRequest } from "../entities/Request";
 import { Offer } from "../entities/Offer";
 import { AppSetting } from "../entities/AppSetting";
 import dotenv from "dotenv";
+import { Payment } from "../entities/transactions";
 
 dotenv.config();
 
@@ -14,10 +15,9 @@ export const AppDataSource = new DataSource({
   username: process.env.DB_USER,
   password: process.env.DB_PASS,
   database: process.env.DB_NAME,
-  synchronize: true, // Set to false in production
+  synchronize: true,
   logging: false,
-  // Explicitly mapping the entities
-  entities: [User, JobRequest, Offer, AppSetting],
+  entities: [User, JobRequest, Offer, AppSetting, Payment],
   subscribers: [],
   migrations: [],
 });

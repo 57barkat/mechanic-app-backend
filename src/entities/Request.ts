@@ -31,6 +31,8 @@ export class Request {
 
   @Column({ type: "text", nullable: true })
   description?: string;
+  @Column({ type: "varchar", length: 255, nullable: true })
+  areaName?: string;
 
   @Column("double precision")
   lat!: number;
