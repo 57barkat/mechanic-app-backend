@@ -13,27 +13,38 @@ interface AuthRequest extends ExRequest {
 }
 
 const ACTIVE_STATUSES = ["pending", "accepted", "arrived", "working"];
-
+const PROBLEM_RATES: Record<string, { base: number; perKm: number }> = {
+  "Flat Tire": { base: 150, perKm: 40 },
+  "Battery Jump": { base: 100, perKm: 30 },
+  "Engine Issue": { base: 300, perKm: 60 },
+  "Fuel Delivery": { base: 80, perKm: 30 },
+  "Tow Required": { base: 500, perKm: 100 },
+  "Locked Out": { base: 120, perKm: 40 },
+  "General Help": { base: 100, perKm: 25 },
+};
 export const createRequest = async (req: AuthRequest, res: Response) => {
   try {
-    const { problemType, lat, lng, description, areaName } = req.body;
-    const user = req.user as User;
+    // Radius ko body se pakrein, agar nahi hai to default 5km rakhein
+    const { problemType, lat, lng, description, areaName, radius } = req.body;
+    const searchRadius = radius || 5;
 
+    const user = req.user as User;
     if (!lat || !lng || !problemType || !description) {
       return res.status(400).json({ message: "Missing fields" });
     }
 
     const requestRepo = AppDataSource.getRepository(JobRequest);
     const userRepo = AppDataSource.getRepository(User);
-    const offerRepo = AppDataSource.getRepository(Offer); // Needed for timeout cleanup
+    const offerRepo = AppDataSource.getRepository(Offer);
 
+    // Pehle se pending requests ko cancel karein
     await requestRepo.update(
       { user: { id: user.id }, status: In(["pending", "accepted"]) },
       { status: "cancelled" },
     );
-
     io.to(`user_${user.id}`).emit("request:cleared_previous");
 
+    // Database se online helpers nikalein (Price calculation ke liye)
     const onlineHelpers = await userRepo.find({
       where: {
         role: UserRole.HELPER,
@@ -44,7 +55,10 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       },
     });
 
-    let suggestedPrice = 100;
+    // Price Calculation Logic
+    const config = PROBLEM_RATES[problemType] || { base: 100, perKm: 50 };
+    let suggestedPrice = config.base;
+
     if (onlineHelpers.length > 0) {
       const distances = onlineHelpers.map((h) =>
         getDistance(
@@ -53,11 +67,11 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
         ),
       );
       const nearestDistanceKm = Math.min(...distances) / 1000;
-      suggestedPrice += nearestDistanceKm * 50;
+      suggestedPrice += nearestDistanceKm * config.perKm;
     }
-
     suggestedPrice = Math.round(suggestedPrice);
 
+    // Naya Request create karein
     const newRequest = requestRepo.create({
       user,
       problemType,
@@ -68,27 +82,40 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       status: "pending",
       suggestedPrice,
     });
-
     await requestRepo.save(newRequest);
 
-    for (const mechanic of onlineMechanics.values()) {
-      if (mechanic.isBusy) continue;
+    // --- RADIUS FILTERING LOGIC ---
+    let foundNearby = false;
 
-      io.to(mechanic.socketId).emit("request:new", {
-        requestId: newRequest.id,
-        userId: user.id,
-        userName: user.name,
-        problemType,
-        description,
-        areaName,
-        lat,
-        lng,
-        suggestedPrice,
-      });
+    for (const mechanic of onlineMechanics.values()) {
+      if (mechanic.isBusy || !mechanic.lat || !mechanic.lng) continue;
+
+      // Distance calculate karein (KM mein)
+      const dist =
+        getDistance(
+          { latitude: lat, longitude: lng },
+          { latitude: mechanic.lat, longitude: mechanic.lng },
+        ) / 1000;
+
+      // Sirf select kiye gaye radius ke andar walay mechanics ko bhein
+      if (dist <= searchRadius) {
+        foundNearby = true;
+        io.to(mechanic.socketId).emit("request:new", {
+          requestId: newRequest.id,
+          userId: user.id,
+          userName: user.name,
+          problemType,
+          description,
+          areaName,
+          lat,
+          lng,
+          suggestedPrice,
+          distance: dist.toFixed(1),
+        });
+      }
     }
 
-    // --- PRO TIMEOUT LOGIC START ---
-    // Start a 5-minute timer to auto-cancel if no one accepts
+    // Timeout logic (5 mins)
     setTimeout(
       async () => {
         try {
@@ -96,25 +123,15 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
             where: { id: newRequest.id },
             relations: ["user", "helper"],
           });
-
-          // Check if the request is still pending and has no helper assigned
           if (checkReq && checkReq.status === "pending" && !checkReq.helper) {
             checkReq.status = "cancelled";
             await requestRepo.save(checkReq);
-
-            // Delete any bids/offers sent by mechanics for this dead request
             await offerRepo.delete({ request: { id: checkReq.id } });
-
-            // Notify the app/frontend that this request is now gone
             io.emit("request:unavailable", { requestId: checkReq.id });
             io.to(`user_${checkReq.user.id}`).emit("ride:cancelled", {
               requestId: checkReq.id,
               reason: "timeout",
             });
-
-            console.log(
-              `⏱️ Auto-cancelled request ${checkReq.id} (No response in 5 mins)`,
-            );
           }
         } catch (timeoutErr) {
           console.error("Error in request timeout check:", timeoutErr);
@@ -123,8 +140,13 @@ export const createRequest = async (req: AuthRequest, res: Response) => {
       5 * 60 * 1000,
     );
 
+    // Final Response: Agar koi mechanic radius mein nahi mila to "noNearbyFound" bhein
     return res.status(201).json({
-      message: "Request created",
+      message: foundNearby
+        ? "Request created"
+        : "Request created but no one nearby",
+      noNearbyFound: !foundNearby,
+      currentRadius: searchRadius,
       request: {
         id: newRequest.id,
         userId: user.id,
@@ -169,12 +191,26 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ message: "Request already accepted" });
     }
 
-    const existingOffer = await offerRepo.findOne({
+    // --- NEW COOLDOWN LOGIC START ---
+    const lastOffer = await offerRepo.findOne({
       where: { request: { id: requestId }, mechanic: { id: mechanic.id } },
+      order: { createdAt: "DESC" },
     });
-    if (existingOffer) {
-      return res.status(400).json({ message: "Offer already sent" });
+
+    if (lastOffer) {
+      const now = new Date();
+      const lastTime = new Date(lastOffer.createdAt);
+      const diffInSeconds = Math.floor(
+        (now.getTime() - lastTime.getTime()) / 1000,
+      );
+
+      if (diffInSeconds < 60) {
+        return res.status(429).json({
+          message: `Please wait ${60 - diffInSeconds} seconds before updating your offer.`,
+        });
+      }
     }
+    // --- NEW COOLDOWN LOGIC END ---
 
     const rawDistance =
       mechanic.lat && mechanic.lng
@@ -211,6 +247,7 @@ export const makeOffer = async (req: AuthRequest, res: Response) => {
 
     return res.json({ message: "Offer sent", offerId: offer.id });
   } catch (err) {
+    console.error("Make Offer Error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 };
@@ -481,13 +518,18 @@ export const cancelRide = async (req: AuthRequest, res: Response) => {
 
     const isUser = request.user.id === user.id;
     const isHelper = request.helper?.id === user.id;
+
     if (!isUser && !isHelper) {
       return res.status(403).json({ message: "Forbidden" });
     }
 
+    // Identify who initiated the cancellation
+    const cancelledByRole = isUser ? "user" : "helper";
+
     request.status = "cancelled";
     await requestRepo.save(request);
 
+    // Global emit to clear it from other mechanics' lists
     io.emit("request:unavailable", { requestId: request.id });
 
     if (request.helper) {
@@ -498,22 +540,35 @@ export const cancelRide = async (req: AuthRequest, res: Response) => {
       }
     }
 
-    io.to(`request_${request.id}`).emit("ride:cancelled", { requestId });
-    io.to(`user_${request.user.id}`).emit("ride:cancelled", { requestId });
+    // Send the cancellation data including the role
+    const cancelPayload = {
+      requestId: request.id,
+      cancelledByRole: cancelledByRole,
+    };
+
+    // Notify the User
+    io.to(`user_${request.user.id}`).emit("ride:cancelled", cancelPayload);
+
+    // Notify the Mechanic/Helper
     if (request.helper) {
-      io.to(`mechanic_${request.helper.id}`).emit("ride:cancelled", {
-        requestId,
-      });
+      io.to(`mechanic_${request.helper.id}`).emit(
+        "ride:cancelled",
+        cancelPayload,
+      );
     }
 
-    // Update map for everyone
+    // Update the live map for everyone
     const activeList = Array.from(onlineMechanics.values()).filter(
       (m) => !m.isBusy,
     );
     io.emit("mechanics:update", activeList);
 
-    return res.json({ message: "Ride cancelled" });
+    return res.json({
+      message: "Ride cancelled successfully",
+      cancelledByRole,
+    });
   } catch (err) {
+    console.error("Backend Cancel Error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 };
