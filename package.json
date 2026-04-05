@@ -1,9 +1,12 @@
 {
   "name": "mechanic-app-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Mechanic Rescue App Backend",
+  "main": "dist/index.js",
   "scripts": {
+    "start": "node init && node dist/index.js",
+    "dev": "node init && ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "node init && tsc",
     "test": "echo \"Error: no test specified\" && exit 1",
     "typeorm": "typeorm-ts-node-commonjs -d src/config/db.ts",
     "migration:generate": "npm run typeorm migration:generate src/migrations/AutoMigration",
@@ -23,6 +26,7 @@
     "express": "^5.2.1",
     "geolib": "^3.3.4",
     "jsonwebtoken": "^9.0.3",
+    "node-fetch": "^3.3.2",
     "pg": "^8.16.3",
     "reflect-metadata": "^0.2.2",
     "socket.io": "^4.8.3",
